@@ -1,32 +1,262 @@
 ---
 title: "Practical Machine Learning Course Project"
 author: "P. Fleer"
-date: "15 April 2017"
-output: html_document
+date: "28 April 2017"
+output: 
+  html_document: 
+    keep_md: yes
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## R Markdown
+## Executive Summary
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+Using data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants, this report aims at predicting the manner in which the participants executed a series of training exercises. They had to perform barbell lifts correctly and incorrectly in 5 different ways. 
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+The data for this project come originally from the Human Activity Recognition ([HAR](http://groupware.les.inf.puc-rio.br/har)) site. But for this project the data were downloaded from a cloudfront site indicated by the assignment prescriptions (see below).
 
-```{r cars}
-summary(cars)
+For more information see: Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. “Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human ’13)”. Stuttgart, Germany: ACM SIGCHI, 2013 (see pdf [here](https://github.com/lgreski/datasciencectacontent/blob/master/markdown/resources/2013.Velloso.QAR-WLE.pdf)).
+
+Concretely, the task is to estimate the outcome variable "Classe" indicating the five possible manners (classes) of execution by the prediction variables containing the accelerator measurements. The classes were defined as follows: class A: exact performance according to the specification, class B: throwing the elbows to the front, class C: lifting the dumbbell only halfway, class D: lowering the dumbbell only halfway, class E: throwing the hips to the front.  
+
+The report concludes that, out of three models, the random forest model works best to predict the quality of performing the exercises.
+
+##Download Data
+````{r, eval=FALSE}
+gettrain <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+download.file(gettrain, destfile = "./pml-training.csv")
+
+gettest <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+download.file(gettest, destfile = "./pml-testing.csv")
 ```
 
-## Including Plots
-
-You can also embed plots, for example:
-
-```{r pressure, echo=FALSE}
-plot(pressure)
+##Loading Data Sets
+```{r message=FALSE}
+library(caret)
+trainRaw <- read.csv("pml-training.csv", header = TRUE)
+testRaw <- read.csv("pml-testing.csv", header = TRUE)
+(nacount <-  length(trainRaw[, apply(is.na(trainRaw), 2, any)]))
+(nzvcount <- length(nearZeroVar(trainRaw)))
+#str(trainRaw)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+A look into the data shows, that out of the 160 columns there are plenty with NAs or with values near zero variance (NZV). Moreover, str(trainRaw), which is not executed here, shows that the first 6 columns are ID variables which do not matter for the prediction exercise. We will remove these columns. 
 
-This is a testfile
+##Cleaning Training Data
+
+```{r}
+##Removing columns
+trainset <- trainRaw[, -c(1:6)]
+##Remove NZA
+nzv <- nearZeroVar(trainset)
+trainset <- trainset[, -nzv]
+dim(trainset)
+
+#Removing mostly NA
+na97    <- sapply(trainset, function(x) mean(is.na(x))) > 0.97
+trainset <- trainset[, na97==FALSE]
+dim(trainset)
+```
+
+##Partitioning Training Data
+Now, after having reduced the variables to `r dim(trainset)[2]`, we are going to create a training set proper to build the models and a validation set to establish out-of-sample error. We will apply a 80 : 20 split of training and validation samples respectively.
+
+```{r}
+intrain  <- createDataPartition(trainset$classe, p=0.80, list=FALSE)
+train <- trainset[intrain, ]
+validation  <- trainset[-intrain, ]
+```
+
+##Exploratory Analysis of Training Set 
+
+```{r}
+#Overview over the predictor variables
+sumvar <- summary(train[,1])
+for(i in 2 : (ncol(train)-1)) {
+    var <- summary(train[,i])
+    sumvar <- rbind(sumvar, var)
+}
+rownames(sumvar) <- names(train[1:nrow(sumvar)])
+sumvar
+```
+
+The overview does not show any irregularities that would require treatments.
+
+A correlation plot shows that there are a few highly correlated variables, but their number is limited. So we do not care about them and trust in the models that they will handle them correctly.
+ 
+```{r fig.width=16, fig.height=16, fig.align="center"}
+library(corrplot)
+corMatrix <- cor(train[, -54])
+corrplot(corMatrix, order = "FPC", method = "square", type = "lower", title = "Correlation plot of variables",
+         mar=c(0,0,1,0), tl.cex = 0.8, tl.col = rgb(0, 0, 0))
+```
+
+The following histogram shows that the frequencies of the outcome variable "Classe" are within reasonable margins. So we can abstain from any normalizing treatment.
+
+```{r fig.align="center"}
+library(plyr); library(ggplot2)
+fcount <- count (train$classe)
+names(fcount) <- c("Classe", "Frequency")
+g1 <- ggplot(fcount, aes(x=Classe, y=Frequency, fill=Classe))#, fill=lang))  #, fill = "blue")) 
+g1 <- g1 + geom_bar(stat="identity")
+g1 <- g1 + ggtitle("Frequency of Classes")
+g1
+```
+
+##Building Prediction Models
+
+We are going to build three models: Random Forest (RF), Gradient Boosting Machine (GBM) and Classification And Regression Trees (CART). That is to say, in order to shorten the knitr rendering procedure we have built and saved them beforehand. So they only have to be loaded. For reasons of transparency we show the code but do not execute it. 
+
+###Random Forest Model
+
+```{r eval=FALSE, message=FALSE}
+#Configure parallel processing
+library(parallel); library(doParallel)
+clust <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(clust)
+
+#Build model
+set.seed(1234)
+
+##Configure trainControl object
+ctrlrf <- trainControl(method = "cv", number = 10, allowParallel = TRUE)
+
+##Develop training model
+system.time(modrf <- train(classe ~ ., data=train, method="rf", trControl=ctrlrf))
+
+#Save model
+save(modrf, file="modelRF.RData")
+
+##De-register parallel processing cluster
+stopCluster(clust)
+registerDoSEQ()
+```
+
+The most important characteristics of the model are shown below. The best accuracy was reached with a split of 27 variables. VarImp() shows the 20 most important of them.
+
+```{r message=FALSE, fig.align="center"}
+#Load model
+load(file="modelRF.RData", verbose=TRUE)
+modrf
+plot(modrf)
+varImp(modrf)
+
+```
+
+
+We have an accuracy of `r modrf$results[2,2]` and an in-sample error of `r (1-modrf$results[2,2])*100`%.
+
+By cross-validating with the validation set we get the out-of-sample error.
+
+```{r}
+#Prediction of validation set
+predrfval <- predict(modrf, newdata=validation)
+(cfmrfval <- confusionMatrix(predrfval, validation$classe))
+```
+
+That gives an accuracy of `r cfmrfval$overall[1]` or an out-of-sample error of `r (1-cfmrfval$overall[1])*100`%. Interestingly, the out-of-sample error seems to be slightly smaller than the in-sample error, which is not what we would expect. But both values are above the bottom line for the final prediction exercise suggested by [Leonard Greski](https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-requiredModelAccuracy.md). 
+
+We will try GBM and CART models in order to have a basis for comparison of models. As with the RF model, we built and saved these models beforehand and only load them here; code is shown for transparency.
+
+###GBM-Model
+
+```{r, eval=FALSE}
+#Configure parallel processing
+library(parallel); library(doParallel)
+clust <- makeCluster(detectCores() - 1) ## convention to leave 1 core for OS
+registerDoParallel(clust)
+
+#Build model
+set.seed(1234)
+ctrlgbm <- trainControl(allowParallel = TRUE)
+system.time(modgbm <- train(classe ~ ., data=train, method="gbm", trControl=ctrlgbm))
+modgbm
+modgbm$finalModel
+confusionMatrix.train(modgbm)
+
+#Save model
+save(modgbm, file="modelGBM.RData")
+
+##De-register parallel processing cluster
+stopCluster(clust)
+registerDoSEQ()
+```
+
+```{r}
+#Load model
+load(file="modelGBM.RData", verbose=TRUE)
+```
+
+At this stage, we are interested only in the out-of-sample error.
+
+```{r message=FALSE}
+##Prediction of validation set
+predgbmval <- predict(modgbm, newdata=validation)
+(cfmgbmval <- confusionMatrix(predgbmval, validation$classe))
+```
+
+With accuracy of `r cfmgbmval$overall[1]` and out-of-error rate of `r (1-cfmgbmval$overall[1])*100`, this model is worse than RF. Yet, the accuracy is also above the "Greski benchmark" of at least .99.
+
+###CART-Model
+
+```{r, eval=FALSE}
+#Configure parallel processing
+library(parallel); library(doParallel)
+clust <- makeCluster(detectCores() - 1)
+registerDoParallel(clust)
+
+#Build model
+set.seed(1234)
+ctrlcart <- trainControl(allowParallel = TRUE)
+system.time(modcart <- train(classe ~ ., data=train, method="rpart", trControl=ctrlcart))
+
+#Save
+save(modcart, file="modelCART.RData")
+
+##De-register parallel processing cluster
+stopCluster(clust)
+registerDoSEQ()
+```
+
+```{r message=FALSE}
+#Load model
+load(file="modelCART.RData", verbose=TRUE)
+modcart$result[1,2]
+```
+
+At first glance, we see that this model with accuracy of `r modcart$result[1,2]` is out of consideration.
+
+##Prediction on Test Set with Random Forest Model
+
+We will use the RF model for predicting the 20 cases in the test set. No cleaning is performed with the test set.
+
+```{r}
+#Predict test samples
+predtest <- predict(modrf, newdata=testRaw)
+predtest
+summary(predtest)
+```
+
+##Conclusion
+
+Random Forest turned out to be the best model. It was sufficently accurate (accuracy above .99), so no further technique like e.g. model stacking was necessary. The prediction exercise on the test set had 100% accuracy.
+
+##Write up Predictions
+
+We write up the predictions to text.files with the given R code from the assignment.
+
+```{r}
+# write up
+pml_write_files = function(x) {
+    n = length(x)
+    for (i in 1:n) {
+        filename = paste0("problem_id_", i, ".txt")
+        write.table(x[i], file = filename, quote = FALSE, row.names = FALSE, 
+            col.names = FALSE)
+    }
+}
+
+pml_write_files(predtest)
+```
